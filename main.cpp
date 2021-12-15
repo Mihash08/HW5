@@ -1,31 +1,21 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <unistd.h>
-#include <random>
 #include <thread>
 #include <queue>
 #include <chrono>
 #include <iostream>
-#include <condition_variable>
+#include <utility>
 
-const int bufSize = 10;
-int buf[bufSize] ; //буфер
+pthread_mutex_t mutex_changing_queues ; // Мьютекс для изменений очередей
+pthread_mutex_t mutex_sleep_section_1 ; // Мьютекс для засыпания первого продавца
+pthread_mutex_t mutex_sleep_section_2 ; // Мьютекс для засыпания второго продовцы
+pthread_mutex_t mutex_printing ;        // Мьютекс для вывода в консоль
 
-int rear = 0 ; //индекс для записи в буфер
-int front = 0 ; //индекс для чтения из буфера
+pthread_cond_t cond_section_1;          // Условие для того, чтобы разбудить первого продавца
+pthread_cond_t cond_section_2;          // Условие для того, чтобы разбудить второго продавца
 
-sem_t  empty ; //семафор, отображающий насколько  буфер пуст
-sem_t  full ; //семафор, отображающий насколько полон буфер
-
-pthread_mutex_t mutex_changing_queues ;
-pthread_mutex_t mutex_sleep_section_1 ;
-pthread_mutex_t mutex_sleep_section_2 ;
-pthread_mutex_t mutex_printing ;
-
-pthread_cond_t cond_section_1;
-pthread_cond_t cond_section_2;
 struct ShoppingItem {
     bool first_section;
     int count;
@@ -36,26 +26,31 @@ struct ShoppingItem {
 };
 
 struct Customer {
+    // Вообще по-хорошему список покупок состоит из n пунктов, каждый из которых принадлежит первой или второй секции
+    // Я же объединил m подряд идущих пункты принадлежащие одной секции в один пункт длины m
+    // Это позволяет упростить алгоритм
+    // После вычеркивания каждого пункта покупатель всегда переходит в другую очередь
+    // или уходит из магазина, если список стал пуст.
     std::queue<ShoppingItem> shopping_list;
     std::string name;
-    Customer(std::string name) {
-        this->name = name;
+    explicit Customer(std::string name) {
+        this->name = std::move(name);
         for (int i = 0; i < rand() % 3 + 3; ++i) {
             shopping_list.push(ShoppingItem());
         }
     }
-    Customer() {
+    Customer() = default;
 
-    }
     bool topSectionIsFirst() {
         return shopping_list.front().first_section;
     }
 };
 
+// Очереди покупателей в первой и второй секции
 std::queue<Customer> queue_section_1;
 std::queue<Customer> queue_section_2;
 
-void *Seller(void *param) {
+[[noreturn]] void *Seller(void *param) {
     bool is_first_section = ((int*)param);
     pthread_mutex_t *this_mutex;
     pthread_cond_t *this_cond, *other_cond;
@@ -63,6 +58,7 @@ void *Seller(void *param) {
     std::queue<Customer> *other_queue;
     std::string other_section_name;
     std::string this_section_name;
+
     if (is_first_section) {
         this_queue = &queue_section_1;
         other_queue = &queue_section_2;
@@ -80,43 +76,61 @@ void *Seller(void *param) {
         other_section_name = "1";
         this_section_name = "2";
     }
+
+    // В самом начале работы программы все продавцы спят
     pthread_cond_wait(this_cond, this_mutex);
+
     while (true) {
         if (this_queue->empty()) {
+            // Если очередь пустая, продавец выводит сообщение о том, что засыпает и засыпает, пока не получит сигнал
+            // Как только он просыпается, он выводит об этом сообщение и продолжает работу
             pthread_mutex_lock(&mutex_printing);
             std::cout << "Seller in section " << this_section_name << " is out of customers and has gone to sleep\n";
             pthread_mutex_unlock(&mutex_printing);
+
             pthread_cond_wait(this_cond, this_mutex);
+
             pthread_mutex_lock(&mutex_printing);
             std::cout << "Seller in section " << this_section_name << " just got a customer and has woken up\n";
             pthread_mutex_unlock(&mutex_printing);
         } else {
+            // Каждый покупатель обслуживатеся одну секнуду + по полсекунды за каждый пункт списка
             int wait_time = this_queue->front().shopping_list.front().count * 500 + 1000;
             std::this_thread::sleep_for(std::chrono::milliseconds(wait_time));
+
             pthread_mutex_lock(&mutex_changing_queues);
+            // "Вычеркиваем" первый элемент из списка покупок
             this_queue->front().shopping_list.pop();
             pthread_mutex_lock(&mutex_printing);
             if (this_queue->front().shopping_list.empty()) {
+                // Выводится, если список покупок кончился
                 std::cout << this_queue->front().name << " has been served and has left the shop\n";
             } else {
+                // Выводится, если в списке покупок еще есть элементы
                 std::cout << this_queue->front().name << " has moved to section " << other_section_name << "\n";
+                // В таком случае покупатель добавляется в другую очередь
                 other_queue->push(this_queue->front());
+                // Сигнал посылается на случай, если другой продавец уснул
                 pthread_cond_signal(other_cond);
             }
             pthread_mutex_unlock(&mutex_printing);
+
+            // Покупатель удаляется из сейчасшней очереди
             this_queue->pop();
             pthread_mutex_unlock(&mutex_changing_queues);
         }
     }
-    return nullptr;
 }
 
-void *CustomerManager(void *param) {
+// Этот поток отвечает за добавление новый покупателей
+[[noreturn]] void *CustomerManager(void *param) {
     Customer new_customer;
+    // Очередь, в которую добавляется покупатель
     std::queue<Customer> *this_queue;
     pthread_cond_t *this_condition;
     std::string this_section_name;
     int customer_count = 1;
+
     while (true) {
         new_customer = Customer("Customer_" + std::to_string(customer_count));
         if (new_customer.topSectionIsFirst()) {
@@ -128,6 +142,7 @@ void *CustomerManager(void *param) {
             this_condition = &cond_section_2;
             this_section_name = "2";
         }
+
         pthread_mutex_lock(&mutex_changing_queues);
         this_queue->push(new_customer);
         pthread_mutex_unlock(&mutex_changing_queues);
@@ -136,10 +151,11 @@ void *CustomerManager(void *param) {
         std::cout << "New customer " << new_customer.name << " joined queue in section " << this_section_name <<"\n";
         customer_count++;
         pthread_mutex_unlock(&mutex_printing);
+
+        // Сигнал, чтобы разбудить продавца, если он спит
         pthread_cond_signal(this_condition);
         std::this_thread::sleep_for(std::chrono::milliseconds(2000 + rand() % 10000));
     }
-    return nullptr;
 }
 
 int main() {
@@ -155,10 +171,10 @@ int main() {
 
     pthread_create(&threadP[0],nullptr,Seller, (void*)(true_bool));
     pthread_create(&threadP[1],nullptr,Seller, (void*)(false_bool));
-    pthread_create(&threadP[2],nullptr,CustomerManager, (NULL));
-    pthread_join(threadP[0], NULL);
-    pthread_join(threadP[1], NULL);
-    pthread_join(threadP[2], NULL);
+    pthread_create(&threadP[2],nullptr,CustomerManager, (nullptr));
+    pthread_join(threadP[0], nullptr);
+    pthread_join(threadP[1], nullptr);
+    pthread_join(threadP[2], nullptr);
 
     pthread_mutex_destroy(&mutex_sleep_section_1);
     pthread_mutex_destroy(&mutex_sleep_section_2);
