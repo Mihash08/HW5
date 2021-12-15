@@ -137,7 +137,7 @@ void *CustomerManager(void *param) {
         customer_count++;
         pthread_mutex_unlock(&mutex_printing);
         pthread_cond_signal(this_condition);
-        std::this_thread::sleep_for(std::chrono::milliseconds(5000 + rand() % 4000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000 + rand() % 10000));
     }
     return nullptr;
 }
